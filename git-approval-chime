@@ -1,0 +1,144 @@
+#!/bin/bash
+# git-approval-chime: play a sound while git is stuck waiting for you to approve
+# an SSH key use (1Password, Secretive, or any agent / signer that asks first).
+#
+# git calls this script in two roles, told apart by the first argument:
+#   gpg.ssh.program  -> always called with "-Y sign|verify|find-principals ..."
+#   core.sshCommand  -> called with ssh options or a host, never "-Y"
+set -u
+
+VERSION=0.1.0
+SECTION=approval-chime
+
+usage() {
+  cat <<EOF
+usage: git approval-chime install     wrap gpg.ssh.program and core.sshCommand
+       git approval-chime uninstall   restore what install replaced
+       git-approval-chime --help | --version
+
+Settings (git config):
+  approval-chime.delay   seconds to wait before the first chime (default 3)
+  approval-chime.sound   sound file for afplay (default Glass.aiff)
+EOF
+}
+
+cfg() { git config --get "$SECTION.$1" || printf '%s\n' "$2"; }
+
+start_chime() {
+  local delay sound parent=$$
+  delay=$(cfg delay 3)
+  sound=$(cfg sound /System/Library/Sounds/Glass.aiff)
+  (
+    sleep "$delay"
+    # Re-check the parent each time so a SIGKILLed parent cannot leave it ringing.
+    while kill -0 "$parent" 2>/dev/null; do afplay "$sound"; sleep 2; done
+  ) 2>/dev/null &
+  chime=$!
+  disown "$chime"
+  trap stop_chime EXIT
+}
+
+# Freeze the loop first, or killing its sleep lets it start one more afplay.
+# It can be called twice (on authentication and on exit); the parent check keeps
+# the second call off a process that has since reused the pid.
+stop_chime() {
+  [ "$(ps -o ppid= -p "$chime" 2>/dev/null | tr -d ' ')" = "$$" ] || return 0
+  kill -STOP "$chime" 2>/dev/null
+  pkill -P "$chime" 2>/dev/null
+  kill -KILL "$chime" 2>/dev/null
+}
+
+# Signing returns at once unless the signer is waiting for approval.
+sign() {
+  start_chime
+  "$(cfg sign-program ssh-keygen)" "$@"
+}
+
+# A transfer can be slow on its own, so time only the authentication: it ends
+# when ssh logs "Authenticated to" at LogLevel VERBOSE.
+ssh_wrap() {
+  start_chime
+  exec 3>&1
+  # Run the saved command the way git runs core.sshCommand.
+  sh -c "$(cfg ssh-command ssh) -o LogLevel=VERBOSE \"\$@\"" ssh "$@" 2>&1 1>&3 3>&- |
+    while IFS= read -r line; do
+      case "$line" in
+        "Authenticated to "*) stop_chime ;;
+        # Lines that only exist because of LogLevel=VERBOSE.
+        "Transferred: sent "* | "Bytes per second: "*) ;;
+        *) printf '%s\n' "$line" >&2 ;;
+      esac
+    done
+  exit "${PIPESTATUS[0]}"
+}
+
+# Absolute path as found on PATH. Symlinks are kept on purpose: under Homebrew
+# the resolved Cellar path disappears on the next upgrade.
+self_path() {
+  local p=$0
+  case $p in */*) ;; *) p=$(command -v "$p") ;; esac
+  printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd)" "$(basename "$p")"
+}
+
+# The file that currently defines a global key, following [include], so a value
+# kept in an included file is replaced there instead of being shadowed by it.
+# An unset key goes where gpg.ssh.program lives: a signer path is machine
+# specific, so that is usually a local file rather than a shared dotfile.
+origin_file() {
+  local key origin
+  for key in "$1" gpg.ssh.program; do
+    origin=$(git config --global --includes --show-origin --get "$key" | cut -f1)
+    case $origin in file:*) printf '%s\n' "${origin#file:}"; return ;; esac
+  done
+  printf '%s\n' "$HOME/.gitconfig"
+}
+
+# wrap <key> <saved-key> <new-value>
+wrap() {
+  local file old
+  file=$(origin_file "$1")
+  old=$(git config --global --includes --get "$1")
+  # Saving our own path would make the wrapper call itself forever.
+  case $old in
+    "" | *git-approval-chime*) ;;
+    *) git config --file "$file" "$SECTION.$2" "$old" ;;
+  esac
+  git config --file "$file" "$1" "$3"
+  echo "$1 -> $3 ($file)"
+}
+
+# unwrap <key> <saved-key>
+unwrap() {
+  local file saved
+  case $(git config --global --includes --get "$1") in
+    *git-approval-chime*) ;;
+    *) return 0 ;;
+  esac
+  file=$(origin_file "$1")
+  saved=$(git config --global --includes --get "$SECTION.$2")
+  if [ -n "$saved" ]; then
+    git config --file "$file" "$1" "$saved"
+    echo "$1 -> $saved ($file)"
+  else
+    git config --file "$file" --unset "$1"
+    echo "$1 unset ($file)"
+  fi
+  git config --file "$(origin_file "$SECTION.$2")" --unset "$SECTION.$2" 2>/dev/null
+  return 0
+}
+
+case "${1-}" in
+  install)
+    me=$(self_path)
+    wrap gpg.ssh.program sign-program "$me"
+    wrap core.sshCommand ssh-command "$(printf '%q' "$me")"
+    ;;
+  uninstall)
+    unwrap gpg.ssh.program sign-program
+    unwrap core.sshCommand ssh-command
+    ;;
+  --version | version) echo "git-approval-chime $VERSION" ;;
+  "" | -h | --help | help) usage ;;
+  -Y) sign "$@" ;;
+  *) ssh_wrap "$@" ;;
+esac
